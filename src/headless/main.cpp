@@ -14,6 +14,8 @@
  * along with vital.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <iostream>
+
 #include "JuceHeader.h"
 #include "load_save.h"
 #include "tuning.h"
@@ -123,21 +125,34 @@ bool loadFromCommandLine(HeadlessSynth& synth, const String& command_line) {
     return false;
   
   std::string error;
-  synth.loadFromFile(file, error);
-  return true;
+  bool success = synth.loadFromFile(file, error);
+  if (!success)
+    std::cerr << "Error loading preset " << file_path.toStdString() << ": " << error << std::endl;
+  return success;
 }
 
 int main(int argc, const char* argv[]) {
   HeadlessSynth headless_synth;
-  
+
+  bool tried_load = false;
+  bool loaded = false;
   bool last_arg_was_option = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg != "" && arg[0] != '-' && !last_arg_was_option && loadFromCommandLine(headless_synth, arg))
-      break;
+    if (arg != "" && arg[0] != '-' && !last_arg_was_option) {
+      tried_load = true;
+      if (loadFromCommandLine(headless_synth, arg)) {
+        loaded = true;
+        break;
+      }
+    }
 
     last_arg_was_option = arg[0] == '-' && arg != "--headless";
   }
-  
+
+  if (tried_load && !loaded)
+    return 1;
+
   doRenderToFile(headless_synth, argc, argv);
+  return 0;
 }
