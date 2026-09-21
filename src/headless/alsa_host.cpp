@@ -568,6 +568,12 @@ int run(const HostConfig& cfg, const PatchList& patches, SpscRing<1024>& ring) {
             default:
                 break;
             }
+            // Hand the event to the audio thread BEFORE logging it: the log writes
+            // unbuffered into journald, and if that ever stalls the event in hand
+            // would wait behind it. push() is wait-free and copies m, so the log
+            // below still sees identical data.
+            if (send && !ring.push(m) && ++dropped % 256 == 1)
+                std::fprintf(stderr, "midi: ring full, dropped %ld events\n", dropped);
             if (send && cfg.log_midi) {
                 char nb[16];
                 switch (m.type) {
@@ -590,8 +596,6 @@ int run(const HostConfig& cfg, const PatchList& patches, SpscRing<1024>& ring) {
                 default: break;
                 }
             }
-            if (send && !ring.push(m) && ++dropped % 256 == 1)
-                std::fprintf(stderr, "midi: ring full, dropped %ld events\n", dropped);
         }
     }
     snd_seq_close(seq);
@@ -719,6 +723,25 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
     snd_pcm_hw_params_get_rate(hw, &rate, nullptr);
     snd_pcm_hw_params_get_period_size(hw, &period, nullptr);
     snd_pcm_hw_params_get_buffer_size(hw, &bufferSize);
+
+    // ALSA's post-hw_params default is start_threshold = 1, so playback restarts
+    // with as little as one period queued -- including after every recover()
+    // below, which is how a single xrun cascades. Start on a full buffer instead.
+    // Placed after the get_*() calls above: with bufferSize still 0 this would set
+    // stop_threshold = 0, and writei would then return -EPIPE forever.
+    // stop_threshold is left at buffer_size deliberately: snd-usb-audio disables
+    // its low-latency playback path when stop_threshold > buffer_size.
+    {
+        snd_pcm_sw_params_t* sw = nullptr;
+        snd_pcm_sw_params_alloca(&sw);
+        if (snd_pcm_sw_params_current(pcm, sw) == 0) {
+            snd_pcm_sw_params_set_start_threshold(pcm, sw, bufferSize);
+            snd_pcm_sw_params_set_avail_min(pcm, sw, period);
+            snd_pcm_sw_params_set_stop_threshold(pcm, sw, bufferSize);
+            if (snd_pcm_sw_params(pcm, sw) < 0)
+                std::fprintf(stderr, "audio: sw_params failed (using defaults)\n");
+        }
+    }
     std::fprintf(stderr, "audio: %s @ %u Hz, period %lu x %lu buffer (%.1f ms)\n",
                  device.c_str(), rate, (unsigned long)period, (unsigned long)bufferSize,
                  1000.0 * double(bufferSize) / double(rate));
@@ -760,8 +783,18 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
     float limiterGain = 1.0f;
     const float limiterRelease = 1.0f - std::exp(-1.0f / (0.050f * float(rate)));
     float breathTarget = 0.0f, breathSm = 0.0f;
-    // per-chunk smoothing coefficient (chunks are <= kMaxBufferSize frames)
-    const float breathCoefPerFrame = 1.0f / (cfg.breath_smooth_ms * 0.001f * float(rate));
+    // Exact one-pole coefficient per chunk. The old form used the Euler
+    // linearisation coef = chunk / (tau * rate), whose error grows as tau
+    // shrinks -- 8.6% at 8 ms but 24% at 3 ms, reaching total bypass at
+    // tau == chunk -- so the knob got less honest exactly where it is tuned.
+    // It also silently tracked period_frames. chunk takes at most two values
+    // for a negotiated period, so precompute both and keep expf() off the RT path.
+    const int chunkFull = std::min(n, vital::kMaxBufferSize);
+    const int chunkTail = n % vital::kMaxBufferSize;      // 0 when n divides evenly
+    const float breathTauFrames = cfg.breath_smooth_ms * 0.001f * float(rate);
+    const float breathCoefFull = 1.0f - std::exp(-float(chunkFull) / breathTauFrames);
+    const float breathCoefTail = chunkTail
+        ? 1.0f - std::exp(-float(chunkTail) / breathTauFrames) : breathCoefFull;
     double timeSec = 0.0;
     const double invRate = 1.0 / double(rate);
     const int stride = vital::poly_float::kSize;
@@ -816,7 +849,9 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
                 const int chunk = std::min(n - done, vital::kMaxBufferSize);
                 // smooth breath -> macro1 at chunk rate
                 {
-                    const float coef = std::min(1.0f, breathCoefPerFrame * float(chunk));
+                    // 1 - exp(-x) is in (0,1] by construction, so the recursion below
+                    // cannot overshoot and needs no clamp.
+                    const float coef = (chunk == chunkFull) ? breathCoefFull : breathCoefTail;
                     breathSm += coef * (breathTarget - breathSm);
                     if (macro1) macro1->set(breathSm);
                     // Replicate a DAW rig where breath also drove channel
@@ -862,6 +897,10 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
                                                  snd_pcm_uframes_t(n - done));
             if (w >= 0) { done += int(w); continue; }
             ++xruns;
+            // Report the first one and then every power of two, so a steady
+            // trickle stays visible without ever flooding the RT path.
+            if ((xruns & (xruns - 1)) == 0)
+                std::fprintf(stderr, "audio: xrun (%ld so far)\n", xruns);
             w = snd_pcm_recover(pcm, int(w), 1);
             if (w < 0) { fatalErr = int(w); break; }
         }
