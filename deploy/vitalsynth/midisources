@@ -1,0 +1,72 @@
+#!/bin/bash
+# Show every USB device, which of them actually carry MIDI, how vitalsynth ranks
+# them, and which one it is listening to right now.
+#
+# The wireless receiver draws power from one USB port and sends its signal
+# through a separate USB-MIDI adapter; only the adapter shows up as a MIDI
+# source, so this is how you tell the signal path from the power path.
+set -u
+CONF=${CONF:-/etc/vitalsynth.conf}
+PREFS=$(sed -n 's/^[[:space:]]*midi_prefer[[:space:]]*=[[:space:]]*\([^#]*\).*/\1/p' "$CONF" | tail -1)
+[ -n "${PREFS:-}" ] || PREFS='*,NuEVI,Teensyduino'
+# Trim around entries only -- device names have internal spaces.
+PREFS=$(echo "$PREFS" | sed 's/[[:space:]]*,[[:space:]]*/,/g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+
+rank() {   # $1 = source name -> lowest number wins
+    local name=$1 i=0 star=99 e
+    local IFS=,
+    set -f                      # '*' is a preference token, not a glob
+    for e in $PREFS; do
+        if [ "$e" = "*" ]; then star=$i
+        elif printf '%s' "$name" | grep -qiF -- "$e"; then echo "$i"; return
+        fi
+        i=$((i+1))
+    done
+    set +f
+    echo "$star"
+}
+
+echo "== USB devices =="
+lsusb | grep -iv "root hub" | sed 's/^/   /'
+echo
+echo "== Sound/MIDI cards =="
+if grep -q . /proc/asound/cards 2>/dev/null; then
+    sed 's/^/   /' /proc/asound/cards
+else
+    echo "   (none)"
+fi
+echo
+echo "== MIDI sources visible to the synth (rank: lower wins) =="
+# The synth is also subscribed to the system announce port (0:x) for hot-plug,
+# so skip client 0 and take the real controller.
+cur=$(aconnect -l 2>/dev/null | awk '
+    /^client [0-9]+: .VitalSynth./ {inv=1; next}
+    /^client /{inv=0}
+    inv && /Connected From:/ {
+        sub(/.*Connected From: */, "");
+        n=split($0, a, /, */);
+        for (j=1; j<=n; j++) { split(a[j], b, ":"); if (b[1] != "0") { print a[j]; exit } }
+    }')
+found=0
+while read -r cl nm; do
+    [ -n "$cl" ] || continue
+    case $nm in *"Midi Through"*|*System*) continue;; esac
+    r=$(rank "$nm")
+    mark=""
+    [ -n "${cur:-}" ] && [ "${cur%%:*}" = "$cl" ] && mark="   <== IN USE"
+    printf "   rank %-3s client %-4s %s%s\n" "$r" "$cl" "$nm" "$mark"
+    found=1
+done < <(aconnect -i -l 2>/dev/null | sed -n "s/^client \([0-9]*\): '\([^']*\)'.*/\1 \2/p")
+[ "$found" = 1 ] || echo "   (no hardware MIDI inputs attached)"
+echo
+echo "== Preference order =="
+case ",$PREFS," in
+    *,\*,*) note="       ('*' = any source not named above)" ;;
+    *)      note="       (unlisted devices sort last, below the EWI)" ;;
+esac
+echo "   midi_prefer = $PREFS$note"
+echo "   from $CONF"
+if [ -z "${cur:-}" ]; then
+    echo
+    echo "   vitalsynth currently has NO controller subscribed."
+fi

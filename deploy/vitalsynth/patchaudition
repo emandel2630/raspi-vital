@@ -1,0 +1,61 @@
+#!/bin/bash
+# Play patches back-to-back through the real output at one fixed note and breath,
+# so the bank can be ranked by ear in a single pass instead of noticing one loud
+# patch at a time.
+#
+#   patchaudition            all 28
+#   patchaudition 1 8        patches 1..8
+#   patchaudition 1 8 3      ...held 3 s each
+#
+# Sends to the running synth, so what you hear is exactly what it plays,
+# normalization and trims included. Blowing the EWI meanwhile just mixes in.
+set -u
+FROM=${1:-1}; TO=${2:-28}; HOLD=${3:-2}
+NOTE=${NOTE:-63}          # mid register
+BREATH=${BREATH:-95}      # steady mezzo-forte
+DIR=/etc/vitalsynth.d
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+CLIENT=$(aconnect -l | sed -n "s/^client \([0-9]*\): 'VitalSynth'.*/\1/p" | head -1)
+[ -n "$CLIENT" ] || { echo "vitalsynth is not running" >&2; exit 1; }
+
+# Minimal SMF writer: program change, then one held note at fixed breath.
+mkmid() {  # $1=file $2=program(0-based) $3=hold seconds
+    python3 - "$1" "$2" "$3" "$NOTE" "$BREATH" <<'PY'
+import struct, sys
+path, prog, hold, note, breath = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+TPQ = 480                      # 120 bpm default -> 480 ticks = 0.5 s
+def vlq(n):
+    b = bytearray([n & 0x7F]); n >>= 7
+    while n: b.insert(0, (n & 0x7F) | 0x80); n >>= 7
+    return bytes(b)
+ev = bytearray()
+def add(d, data): ev.extend(vlq(d)); ev.extend(data)
+add(0, bytes([0xC0, prog]))
+add(int(TPQ * 0.8), bytes([0xB0, 0x4A, breath]))   # let the patch load first
+add(0, bytes([0x90, note, 0x64]))
+add(int(TPQ * 2 * hold), bytes([0x80, note, 0x40]))
+add(0, bytes([0xB0, 0x4A, 0]))
+ev.extend(vlq(0) + b'\xFF\x2F\x00')
+open(path, 'wb').write(b'MThd' + struct.pack('>IHHH', 6, 0, 1, TPQ) +
+                       b'MTrk' + struct.pack('>I', len(ev)) + bytes(ev))
+PY
+}
+
+echo "auditioning patches $FROM..$TO — note $NOTE, breath $BREATH, ${HOLD}s each"
+echo "listen for the ones that jump out; then: vitaltrim <patch> <dB>"
+echo
+for p in $(seq "$FROM" "$TO"); do
+    pp=$(printf '%02d' "$p")
+    f=$(ls "$DIR"/${pp}-*.vital 2>/dev/null | head -1)
+    [ -n "$f" ] || continue
+    name=$(basename "$f" .vital)
+    g=$(sed -n "s/^$name \(.*\)/\1/p" "$DIR/.gains" 2>/dev/null)
+    t=$(grep -vE '^[[:space:]]*#' "$DIR/trims.txt" 2>/dev/null | sed -n "s/^$name \(.*\)/\1/p")
+    printf "  %-34s norm %6s  trim %s\n" "$name" "${g:-0.00}" "${t:-—}"
+    mkmid "$TMP/a.mid" "$((p-1))" "$HOLD"
+    aplaymidi -p "$CLIENT:0" "$TMP/a.mid"
+    sleep 0.35
+done
+echo
+echo "done."
