@@ -31,6 +31,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
+#include <climits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,6 +49,14 @@ struct HostConfig {
     int patch_cc = -1;               // optional CC that cycles patches
     std::string patch_dir = "/etc/vitalsynth.d";
     std::string audio_device = "auto";
+    std::string audio_prefer = "HA3,ATR2xUSB";  // USB DAC preference, best first
+    // MIDI input preference, best first, matched case-insensitively as a
+    // substring of the ALSA client name. "*" may be used as the slot for any
+    // source matching no other entry; with no "*" (as here) an unlisted device
+    // sorts last, so a stray USB gadget cannot steal the input from the
+    // instrument. U2MIDI Pro is the USB-MIDI adapter carrying the midiBeam
+    // RX02 wireless receiver; NuEVI/Teensyduino is the EWI's own USB port.
+    std::string midi_prefer = "U2MIDI Pro,midiBeam,RX02,NuEVI,Teensyduino";
     int sample_rate = 48000;
     int period_frames = 128;
     int periods = 2;
@@ -77,6 +87,8 @@ struct HostConfig {
         if (ii("oversampling", oversampling)) return;
         if (!std::strcmp(key, "patch_dir")) { patch_dir = val; return; }
         if (!std::strcmp(key, "audio_device")) { audio_device = val; return; }
+        if (!std::strcmp(key, "audio_prefer")) { audio_prefer = val; return; }
+        if (!std::strcmp(key, "midi_prefer")) { midi_prefer = val; return; }
         std::fprintf(stderr, "config: unknown key '%s' (ignored)\n", key);
     }
     bool loadFile(const char* path) {
@@ -87,8 +99,15 @@ struct HostConfig {
             char* hash = std::strchr(line, '#');
             if (hash) *hash = 0;
             char key[128], val[256];
-            if (std::sscanf(line, " %127[A-Za-z0-9_] = %255s", key, val) == 2)
-                set(key, val);
+            // Take the rest of the line, not %s: a value may contain spaces
+            // ("midi_prefer = midiBeam RX02, *, NuEVI"), and %s silently kept
+            // only the first word. Comments are already cut above, so trailing
+            // whitespace is all that needs trimming.
+            if (std::sscanf(line, " %127[A-Za-z0-9_] = %255[^\n]", key, val) == 2) {
+                size_t n = std::strlen(val);
+                while (n > 0 && std::isspace((unsigned char)val[n - 1])) val[--n] = 0;
+                if (n > 0) set(key, val);
+            }
         }
         std::fclose(fp);
         return true;
@@ -258,6 +277,29 @@ static void loaderLoop(HostSynth& synth, const HostConfig& cfg, const PatchList&
     }
 }
 
+// Comma-separated preference list -> trimmed tokens, best first. Only the
+// whitespace AROUND an entry is stripped: device names have internal spaces
+// ("Cubilux HA-3", "midiBeam RX02"), and eating those made such an entry match
+// nothing at all.
+static std::vector<std::string> splitPrefs(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    auto flush = [&out, &cur]() {
+        const size_t b = cur.find_first_not_of(" \t");
+        if (b != std::string::npos) {
+            const size_t e = cur.find_last_not_of(" \t");
+            out.push_back(cur.substr(b, e - b + 1));
+        }
+        cur.clear();
+    };
+    for (char c : s) {
+        if (c == ',') flush();
+        else cur.push_back(c);
+    }
+    flush();
+    return out;
+}
+
 // --------------------------------------------------------------- midi input
 namespace midi_in {
 
@@ -278,21 +320,47 @@ bool isHardwareSource(snd_seq_t* seq, int client, int port) {
     return true;
 }
 
-void connectFrom(snd_seq_t* seq, int myPort, int client, int port) {
-    if (snd_seq_connect_from(seq, myPort, client, port) == 0) {
-        snd_seq_client_info_t* cinfo = nullptr;
-        snd_seq_client_info_alloca(&cinfo);
-        snd_seq_get_any_client_info(seq, client, cinfo);
-        std::fprintf(stderr, "midi: connected %d:%d (%s)\n", client, port,
-                     snd_seq_client_info_get_name(cinfo));
+// The rig has two possible controllers: the EWI on its own USB port, and a
+// wireless receiver arriving through a generic USB-MIDI adapter. Only one may
+// be subscribed at a time -- both at once would double every note -- so sources
+// are ranked and the best one wins, re-evaluated on every hot-plug event.
+struct MidiSource {
+    int client = -1;
+    int port = -1;
+    int rank = INT_MAX;
+    std::string name;
+};
+
+// Explicit preference entries match by case-insensitive substring and rank by
+// position. A source matching no explicit entry takes the position of the "*"
+// wildcard, or sorts last when the list has none. So "*,NuEVI" means "any other
+// controller outranks the EWI", which needs no name for the adapter.
+static int rankSource(const std::vector<std::string>& prefs, const std::string& name) {
+    int star = int(prefs.size());
+    for (size_t i = 0; i < prefs.size(); ++i) {
+        if (prefs[i] == "*") { star = int(i); continue; }
+        if (strcasestr(name.c_str(), prefs[i].c_str())) return int(i);
     }
+    return star;
 }
 
-void scanAndConnect(snd_seq_t* seq, int myPort) {
+static std::string clientName(snd_seq_t* seq, int client) {
+    snd_seq_client_info_t* cinfo = nullptr;
+    snd_seq_client_info_alloca(&cinfo);
+    if (snd_seq_get_any_client_info(seq, client, cinfo) < 0) return std::string();
+    return std::string(snd_seq_client_info_get_name(cinfo));
+}
+
+// Subscribe to the highest-ranked hardware source available, dropping whatever
+// was subscribed before. Silences the engine across the switch: a controller
+// unplugged mid-note would otherwise leave that note sounding at full breath.
+void selectSource(snd_seq_t* seq, int myPort, const std::vector<std::string>& prefs,
+                  MidiSource& cur, SpscRing<1024>& ring, const HostConfig& cfg) {
     snd_seq_client_info_t* cinfo = nullptr;
     snd_seq_port_info_t* pinfo = nullptr;
     snd_seq_client_info_alloca(&cinfo);
     snd_seq_port_info_alloca(&pinfo);
+    MidiSource best;
     snd_seq_client_info_set_client(cinfo, -1);
     while (snd_seq_query_next_client(seq, cinfo) == 0) {
         const int client = snd_seq_client_info_get_client(cinfo);
@@ -300,9 +368,39 @@ void scanAndConnect(snd_seq_t* seq, int myPort) {
         snd_seq_port_info_set_port(pinfo, -1);
         while (snd_seq_query_next_port(seq, pinfo) == 0) {
             const int port = snd_seq_port_info_get_port(pinfo);
-            if (isHardwareSource(seq, client, port)) connectFrom(seq, myPort, client, port);
+            if (!isHardwareSource(seq, client, port)) continue;
+            const std::string nm = clientName(seq, client);
+            const int r = rankSource(prefs, nm);
+            if (r < best.rank) { best.client = client; best.port = port; best.rank = r; best.name = nm; }
         }
     }
+    if (best.client < 0) {
+        if (cur.client >= 0) {
+            std::fprintf(stderr, "midi: input gone (%s) — waiting for a controller\n",
+                         cur.name.c_str());
+            cur = MidiSource();
+        }
+        return;
+    }
+    if (best.client == cur.client && best.port == cur.port) return;
+
+    if (cur.client >= 0)
+        snd_seq_disconnect_from(seq, myPort, cur.client, cur.port);
+    if (snd_seq_connect_from(seq, myPort, best.client, best.port) != 0) {
+        std::fprintf(stderr, "midi: cannot subscribe %d:%d (%s)\n",
+                     best.client, best.port, best.name.c_str());
+        return;
+    }
+    // Drop any note/breath the outgoing controller left raised.
+    ring.push({MidiMsg::CC, int16_t(cfg.breath_cc), 0});
+    ring.push({MidiMsg::CC, 123, 0});
+    if (cur.client >= 0)
+        std::fprintf(stderr, "midi: input -> %d:%d (%s), replacing %s\n",
+                     best.client, best.port, best.name.c_str(), cur.name.c_str());
+    else
+        std::fprintf(stderr, "midi: input -> %d:%d (%s)\n",
+                     best.client, best.port, best.name.c_str());
+    cur = best;
 }
 
 double nowSec() {
@@ -379,7 +477,11 @@ int run(const HostConfig& cfg, const PatchList& patches, SpscRing<1024>& ring) {
     if (snd_seq_connect_from(seq, myPort, SND_SEQ_CLIENT_SYSTEM,
                              SND_SEQ_PORT_SYSTEM_ANNOUNCE) < 0)
         std::fprintf(stderr, "midi: warning: no announce subscription (no hot-plug)\n");
-    scanAndConnect(seq, myPort);
+    const std::vector<std::string> midiPrefs = splitPrefs(cfg.midi_prefer);
+    MidiSource current;
+    selectSource(seq, myPort, midiPrefs, current, ring, cfg);
+    if (current.client < 0)
+        std::fprintf(stderr, "midi: no controller connected yet — will attach on plug-in\n");
     std::fprintf(stderr, "midi: ready — breath CC%d -> macro1, %zu patches\n",
                  cfg.breath_cc, patches.names.size());
 
@@ -452,8 +554,16 @@ int run(const HostConfig& cfg, const PatchList& patches, SpscRing<1024>& ring) {
                 selectPatch(int(ev->data.control.value));
                 break;
             case SND_SEQ_EVENT_PORT_START:
-                if (isHardwareSource(seq, ev->data.addr.client, ev->data.addr.port))
-                    connectFrom(seq, myPort, ev->data.addr.client, ev->data.addr.port);
+                // A newly plugged controller may outrank the current one.
+                selectSource(seq, myPort, midiPrefs, current, ring, cfg);
+                break;
+            case SND_SEQ_EVENT_PORT_EXIT:
+                // The subscription is already gone; forget it before re-ranking
+                // so the fallback controller can be picked up.
+                if (ev->data.addr.client == current.client &&
+                    ev->data.addr.port == current.port)
+                    current = MidiSource();
+                selectSource(seq, myPort, midiPrefs, current, ring, cfg);
                 break;
             default:
                 break;
@@ -508,7 +618,7 @@ bool hasPlayback(snd_ctl_t* ctl) {
 
 std::string pickDevice(const HostConfig& cfg, bool verbose) {
     if (cfg.audio_device != "auto") return cfg.audio_device;
-    struct Card { int index; std::string name; };
+    struct Card { int index; std::string id, name, driver; };
     std::vector<Card> cards;
     int card = -1;
     while (snd_card_next(&card) == 0 && card >= 0) {
@@ -519,27 +629,53 @@ std::string pickDevice(const HostConfig& cfg, bool verbose) {
         snd_ctl_card_info_t* info = nullptr;
         snd_ctl_card_info_alloca(&info);
         if (snd_ctl_card_info(ctl, info) == 0 && hasPlayback(ctl))
-            cards.push_back({card, snd_ctl_card_info_get_name(info)});
+            cards.push_back({card,
+                             snd_ctl_card_info_get_id(info),
+                             snd_ctl_card_info_get_name(info),
+                             snd_ctl_card_info_get_driver(info)});
         snd_ctl_close(ctl);
     }
     auto contains = [](const std::string& hay, const char* needle) {
         return strcasestr(hay.c_str(), needle) != nullptr;
     };
-    int usb = -1, headphones = -1, hdmi = -1;
+
+    // A USB DAC is identified by its ALSA driver ("USB-Audio"), never by whether
+    // the vendor happened to put "USB" in the product name -- most don't, and a
+    // name-substring test silently skips them (e.g. "Cubilux HA-3").
+    const std::vector<std::string> prefs = splitPrefs(cfg.audio_prefer);
+    const Card* best = nullptr;
+    const char* why = nullptr;
+    int bestRank = INT_MAX;
     for (const auto& c : cards) {
-        if (usb < 0 && contains(c.name, "usb")) usb = c.index;
-        if (headphones < 0 && (contains(c.name, "headphone") || contains(c.name, "bcm2835")))
-            headphones = c.index;
-        if (hdmi < 0 && contains(c.name, "hdmi")) hdmi = c.index;
+        if (!contains(c.driver, "usb")) continue;
+        int rank = int(prefs.size());          // unlisted USB DACs sort last, but still win
+        for (size_t i = 0; i < prefs.size(); ++i)
+            if (contains(c.id, prefs[i].c_str()) || contains(c.name, prefs[i].c_str())) {
+                rank = int(i);
+                break;
+            }
+        if (rank < bestRank) { bestRank = rank; best = &c; why = "USB DAC"; }
     }
-    int chosen = usb >= 0 ? usb : headphones >= 0 ? headphones : hdmi >= 0 ? hdmi
-               : (cards.empty() ? -1 : cards.front().index);
-    if (chosen < 0) return "default";
-    char dev[32];
-    std::snprintf(dev, sizeof dev, "plughw:%d,0", chosen);
+    if (!best)
+        for (const auto& c : cards)
+            if (contains(c.name, "headphone") || contains(c.driver, "bcm2835")) {
+                best = &c; why = "headphone jack"; break;
+            }
+    if (!best)
+        for (const auto& c : cards)
+            if (contains(c.name, "hdmi") || contains(c.driver, "hdmi")) {
+                best = &c; why = "HDMI"; break;
+            }
+    if (!best && !cards.empty()) { best = &cards.front(); why = "first available"; }
+    if (!best) return "default";
+
+    // Address the card by ID, not index: USB enumeration order changes between
+    // boots and hot-plugs, and plughw:N,0 would then point at the wrong card.
+    char dev[64];
+    std::snprintf(dev, sizeof dev, "plughw:CARD=%s,DEV=0", best->id.c_str());
     if (verbose)
-        std::fprintf(stderr, "audio: auto-selected %s (%s)\n", dev,
-                     usb >= 0 ? "USB DAC" : headphones >= 0 ? "headphone jack" : "HDMI/first");
+        std::fprintf(stderr, "audio: auto-selected %s [%s] (%s)\n",
+                     dev, best->name.c_str(), why);
     return dev;
 }
 

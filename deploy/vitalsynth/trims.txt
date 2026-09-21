@@ -1,0 +1,38 @@
+# Taste adjustments in dB, added on top of auto-normalization.
+# Edit from Windows at \\192.168.0.69\patches\trims.txt then wait ~5 min.
+#
+# A trim means "the auto-normalizer is wrong about this patch by N dB", so a
+# trim is only valid for the normalizer that measured it. 2026-08-30 the
+# normalizer changed from BS.1770 K-weighted energy to a band-loudness model,
+# so the one entry that lived here was retired rather than silently re-applied:
+#
+#   03-phase-squares-dry 2.5
+#
+# It was compensating for that patch reading quiet under the old metric (and for
+# its flat breath response — blowing harder opens the filter but adds no level).
+# Under the new normalization 03 already sits mid-bank, so re-adding this would
+# make it ~2.5 dB hot. Add trims back by ear from here.
+
+# 2026-09-18: 01-saw-lead reads on-target to the band-loudness model (2.32 dB
+# measured vs a 1.41 dB bank target -> -0.90 dB) and is mid-pack by raw RMS,
+# but by ear it is solidly louder than the rest of the bank every time. The
+# measurement is not drifting: it comes out at 2.32 dB whether the patch is
+# measured first or last in the bank, and the rendered output is sample-identical
+# at startup and after switching away and back. So this is a model miss on one
+# patch, which is exactly what a trim is for. Starting point, tune by ear.
+
+# 2026-09-18, second pass. First real listening test at correct output level
+# (the DAC had been 23.5 dB down until now, which invalidated every earlier
+# judgement). Reported: patch 6 much louder than the first few. Measured RMS of
+# the rendered output agrees -- 06-loretta sits at the bank median (-21.0 dBFS)
+# while 02..05 are 5-8 dB BELOW it, so 06 is not hot, 02..05 are quiet.
+# Raising the quiet ones rather than cutting 06, since more level is wanted.
+# These are HALF the measured gap to the bank median: a hedge, because the
+# band-loudness model says these patches are already on target and raw RMS is
+# not a reliable perceptual metric for this bank. Peak headroom checked, all
+# land 7 dB or more below the limiter. Revert any of them with: vitaltrim NN none
+01-saw-lead -1
+02-black-market-bass 2.2
+03-phase-squares-dry 3.7
+04-5ths-saw-dry 3.0
+05-bloopin 2.5

@@ -1,0 +1,57 @@
+#!/bin/bash
+# Set a per-patch taste trim in dB and apply it right away.
+#
+#   vitaltrim              list current trims
+#   vitaltrim 01 -4        trim patch 01 by -4 dB
+#   vitaltrim 01-saw-lead -4
+#   vitaltrim 01 none      remove the trim
+#
+# Editing trims.txt on the share also works, but patchwatch then re-measures the
+# whole bank (~7 min) before reloading. Trims never affect the measurements in
+# .gains, so this skips straight to the reload.
+set -u
+DIR=/etc/vitalsynth.d
+TRIMS=$DIR/trims.txt
+
+list() {
+    echo "current trims (dB, on top of auto-normalization):"
+    grep -vE '^[[:space:]]*(#|$)' "$TRIMS" 2>/dev/null | sed 's/^/   /' || true
+    echo
+    echo "patch bank:"
+    for f in "$DIR"/*.vital; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .vital)
+        g=$(sed -n "s/^$n \(.*\)/\1/p" "$DIR/.gains" 2>/dev/null)
+        t=$(grep -vE '^[[:space:]]*#' "$TRIMS" 2>/dev/null | sed -n "s/^$n \(.*\)/\1/p")
+        printf "   %-32s norm %6s  trim %s\n" "$n" "${g:-0.00}" "${t:-—}"
+    done
+}
+
+[ $# -ge 1 ] || { list; exit 0; }
+
+sel=$1
+name=$(basename "$(ls "$DIR"/${sel}*.vital 2>/dev/null | head -1)" .vital)
+[ -n "$name" ] || { echo "no patch matching '$sel' in $DIR" >&2; exit 1; }
+
+[ $# -ge 2 ] || { echo "usage: ${0##*/} <patch> <dB|none>" >&2; exit 2; }
+val=$2
+
+tmp=$(mktemp)
+grep -v "^$name " "$TRIMS" 2>/dev/null > "$tmp" || true
+if [ "$val" != "none" ]; then
+    case $val in
+        ''|*[!0-9+.-]*) echo "not a dB number: $val" >&2; rm -f "$tmp"; exit 2 ;;
+    esac
+    echo "$name $val" >> "$tmp"
+fi
+
+# patchwatch would otherwise re-measure the whole bank for a taste change.
+sudo systemctl stop patchwatch 2>/dev/null
+cp "$TRIMS" "$TRIMS.bak" 2>/dev/null || true
+cat "$tmp" > "$TRIMS"; rm -f "$tmp"
+sudo systemctl restart vitalsynth
+sleep 3
+sudo systemctl start patchwatch 2>/dev/null
+
+if [ "$val" = "none" ]; then echo "removed trim for $name"; else echo "$name trim = $val dB"; fi
+journalctl -u vitalsynth --since "-10s" --no-pager | grep -E "patch [0-9]+/" | tail -1
