@@ -64,6 +64,23 @@ struct HostConfig {
     float limiter_thresh = 0.95f;
     int log_midi = 1;
     int oversampling = -1;           // -1 = keep patch value; 0/1/2 = 1x/2x/4x
+    // EWI chord mode. The NuEVI sends chord_cc = 127 when chord mode is armed
+    // and 0 when it is disarmed. While armed the current patch is switched to
+    // chord_polyphony voices (patches are mono/legato for lead playing, which
+    // collapses a chord into one gliding note), and output is scaled by
+    // held_notes^-chord_gain_exp so a 4-note chord is not 4x a single line
+    // (patches are loudness-normalised for ONE voice). Disarming restores the
+    // patch's own values. chord_cc = -1 disables all of this.
+    int chord_cc = 86;
+    int chord_polyphony = 5;         // chords are 4 notes (5 with CHORD BASS = SOLO)
+    float chord_gain_exp = 0.5f;     // 0.5: equal loudness for uncorrelated voices; 1.0: equal peak
+    float chord_trim_db = 0.0f;      // extra fixed level while chord mode is armed
+    int chord_glide = 1;             // 1 keep patch portamento in chord mode, 0 force it off
+    // Oversampling while chord mode is armed: 0 = 1x, 1 = 2x, -1 = keep the
+    // patch's. Each chord voice costs as much as the whole mono patch, and
+    // every patch in the bank runs 2x, so 4-5 voices at 2x overruns the Pi 4
+    // on the heavier patches (xruns = lag/crackle). 1x halves that cost.
+    int chord_oversampling = 0;
 
     void set(const char* key, const char* val) {
         auto f = [&](const char* k, float& dst) {
@@ -85,6 +102,12 @@ struct HostConfig {
         if (f("limiter_thresh", limiter_thresh)) return;
         if (ii("log_midi", log_midi)) return;
         if (ii("oversampling", oversampling)) return;
+        if (ii("chord_cc", chord_cc)) return;
+        if (ii("chord_polyphony", chord_polyphony)) return;
+        if (f("chord_gain_exp", chord_gain_exp)) return;
+        if (f("chord_trim_db", chord_trim_db)) return;
+        if (ii("chord_glide", chord_glide)) return;
+        if (ii("chord_oversampling", chord_oversampling)) return;
         if (!std::strcmp(key, "patch_dir")) { patch_dir = val; return; }
         if (!std::strcmp(key, "audio_device")) { audio_device = val; return; }
         if (!std::strcmp(key, "audio_prefer")) { audio_prefer = val; return; }
@@ -124,6 +147,9 @@ struct HostConfig {
         cf(master_gain_db, -60.0f, 24.0f, 0.0f);
         cf(limiter_thresh, 0.1f, 1.0f, 0.95f);
         ci(log_midi, 0, 1); ci(oversampling, -1, 2);
+        ci(chord_cc, -1, 127); ci(chord_polyphony, 1, 16);
+        cf(chord_gain_exp, 0.0f, 1.0f, 0.5f); cf(chord_trim_db, -24.0f, 12.0f, 0.0f);
+        ci(chord_glide, 0, 1); ci(chord_oversampling, -1, 2);
     }
 };
 
@@ -176,12 +202,43 @@ static void onSignal(int) { g_running.store(false); }
 static std::atomic<int> g_requestedPatch{-1};
 static std::atomic<int> g_loadedPatch{-1};
 static std::atomic<float> g_patchGain{1.0f};   // loudness-normalization gain (linear)
+static std::atomic<float> g_chordPatchGain{-1.0f}; // measured chord level of the loaded patch, <0 = none
+static std::atomic<int> g_chordEvent{0};
+// Oversampling the loader thread should hold while chord mode is armed, or -1
+// for "the patch's own". Changing oversampling reallocates engine buffers, so it
+// is done off the RT thread under pauseProcessing (a few ms of silence at arm
+// and disarm), never in the audio callback.
+static std::atomic<int> g_chordOsWant{-1};       // 1 = chord override applied, 2 = removed; logged off the RT thread
+static std::atomic<int> g_chordSavedPoly{1};
 
 struct PatchList {
     std::vector<std::string> paths;
     std::vector<std::string> names;
     std::vector<float> gains;                  // linear, 1.0 = no adjustment
+    // Chord-mode level relative to the patch's own single-note level, from
+    // .gains.chord (written by --normalize / --normalize-chords). Linear;
+    // < 0 means "not measured": chord mode then falls back to held^-chord_gain_exp.
+    std::vector<float> chordGains;
 };
+
+static bool chordFileHas(const std::string& path, const std::string& name) {
+    FILE* g = std::fopen(path.c_str(), "r");
+    if (!g) return false;
+    char line[512];
+    bool found = false;
+    while (!found && std::fgets(line, sizeof line, g)) {
+        std::string text(line);
+        const size_t split = text.find_last_of(" \t", text.find_last_not_of(" \t\r\n"));
+        if (split != std::string::npos) {
+            std::string n = text.substr(0, split);
+            const size_t b = n.find_first_not_of(" \t");
+            if (b != std::string::npos)
+                found = n.substr(b, n.find_last_not_of(" \t") - b + 1) == name;
+        }
+    }
+    std::fclose(g);
+    return found;
+}
 
 static PatchList scanPatches(const std::string& dir) {
     PatchList out;
@@ -199,6 +256,7 @@ static PatchList scanPatches(const std::string& dir) {
         out.paths.push_back(dir + "/" + f);
         out.names.push_back(f.substr(0, f.size() - 6));
         out.gains.push_back(1.0f);
+        out.chordGains.push_back(-1.0f);
     }
     // Apply loudness-normalization gains written by --normalize (name dB pairs),
     // then user taste adjustments from trims.txt (same format, added on top).
@@ -234,6 +292,19 @@ static PatchList scanPatches(const std::string& dir) {
     };
     applyDbFile(dir + "/.gains", 15.0f);
     applyDbFile(dir + "/trims.txt", 18.0f);
+    // Chord levels are SET, not multiplied, and kept apart from .gains: they
+    // apply only while chord mode is armed, on top of the patch gain above.
+    // The file name must keep ".gains" in it -- patchwatch.sh ignores files
+    // matching '\.gains', and anything else written here would retrigger it.
+    {
+        std::vector<float> saved = out.gains;
+        std::fill(out.gains.begin(), out.gains.end(), 1.0f);
+        applyDbFile(dir + "/.gains.chord", 24.0f);
+        for (size_t i = 0; i < out.gains.size(); ++i)
+            if (out.gains[i] != 1.0f || chordFileHas(dir + "/.gains.chord", out.names[i]))
+                out.chordGains[i] = out.gains[i];
+        out.gains = saved;
+    }
     return out;
 }
 
@@ -241,6 +312,13 @@ static PatchList scanPatches(const std::string& dir) {
 // internally takes the synth CriticalSection (pauseProcessing), which the
 // audio thread only tryEnter()s — so audio falls back to silence, never blocks.
 static void loaderLoop(HostSynth& synth, const HostConfig& cfg, const PatchList& patches) {
+    int osApplied = -1;        // chord-mode oversampling override currently in force, -1 none
+    float osPatch = 1.0f;      // the patch's own value, restored when chord mode ends
+    vital::Value* osCtl = nullptr;
+    {
+        auto it = synth.getControls().find("oversampling");
+        if (it != synth.getControls().end()) osCtl = it->second;
+    }
     while (g_running.load(std::memory_order_relaxed)) {
         const int want = g_requestedPatch.load(std::memory_order_acquire);
         if (want >= 0 && want != g_loadedPatch.load(std::memory_order_relaxed) &&
@@ -263,14 +341,46 @@ static void loaderLoop(HostSynth& synth, const HostConfig& cfg, const PatchList&
             }
             synth.getEngine()->checkOversampling();
             synth.pauseProcessing(false);
+            osApplied = -1;   // fresh patch: its own oversampling is in effect again
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             const float gain = patches.gains[size_t(want)];
             g_patchGain.store(gain, std::memory_order_release);
+            g_chordPatchGain.store(patches.chordGains[size_t(want)], std::memory_order_release);
             g_loadedPatch.store(want, std::memory_order_release);
-            std::fprintf(stderr, "patch %d/%zu: %s (%lld ms, norm %+.1f dB)\n", want + 1,
+            const float chordG = patches.chordGains[size_t(want)];
+            char chordInfo[48] = "";
+            if (chordG >= 0.0f)
+                std::snprintf(chordInfo, sizeof chordInfo, ", chord %+.1f dB", 20.0f * std::log10(std::max(chordG, 1e-6f)));
+            std::fprintf(stderr, "patch %d/%zu: %s (%lld ms, norm %+.1f dB%s)\n", want + 1,
                          patches.names.size(), patches.names[size_t(want)].c_str(),
-                         (long long)ms, 20.0f * std::log10(gain));
+                         (long long)ms, 20.0f * std::log10(gain), chordInfo);
+        }
+        // Chord-mode oversampling. Only after the patch the audio thread armed
+        // chord mode on is actually loaded, so a load never undoes it unseen.
+        {
+            const int want = g_chordOsWant.load(std::memory_order_acquire);
+            if (osCtl && want != osApplied) {
+                synth.pauseProcessing(true);
+                if (osApplied < 0) osPatch = osCtl->value();
+                osCtl->set(want >= 0 ? vital::mono_float(want) : osPatch);
+                synth.getEngine()->checkOversampling();
+                synth.pauseProcessing(false);
+                std::fprintf(stderr, "chord: oversampling %dx\n",
+                             1 << int(want >= 0 ? want : int(osPatch)));
+                osApplied = want;
+            }
+        }
+        switch (g_chordEvent.exchange(0, std::memory_order_acq_rel)) {
+        case 1:
+            std::fprintf(stderr, "chord: on (polyphony %d -> %d, glide %s, gain n^-%.2f, trim %+.1f dB)\n",
+                         g_chordSavedPoly.load(std::memory_order_relaxed),
+                         std::max(g_chordSavedPoly.load(std::memory_order_relaxed), cfg.chord_polyphony),
+                         cfg.chord_glide ? "kept" : "off", cfg.chord_gain_exp, cfg.chord_trim_db);
+            break;
+        case 2:
+            std::fprintf(stderr, "chord: off (patch values restored)\n");
+            break;
         }
         struct timespec ts{0, 50 * 1000 * 1000};
         nanosleep(&ts, nullptr);
@@ -766,6 +876,29 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
         it = controls.find("pitch_wheel");
         if (it != controls.end()) pitchWheelCtl = it->second;
     }
+    vital::Value* polyphonyCtl = nullptr;
+    vital::Value* portaTimeCtl = nullptr;
+    {
+        auto& controls = synth.getControls();
+        auto it = controls.find("polyphony");
+        if (it != controls.end()) polyphonyCtl = it->second;
+        it = controls.find("portamento_time");
+        if (it != controls.end()) portaTimeCtl = it->second;
+    }
+
+    // Chord mode state (see HostConfig::chord_cc). Only touched on this thread.
+    bool chordOn = false;            // armed, as last reported by the EWI
+    bool chordApplied = false;       // patch controls currently overridden
+    int chordAppliedPatch = -1;      // patch the override was applied to
+    float savedPolyphony = 1.0f, savedPortaTime = -10.0f;
+    bool held[128] = {};
+    int heldCount = 0;
+    float chordGain = 1.0f;          // smoothed output scale
+    const float chordTrim = std::pow(10.0f, cfg.chord_trim_db * 0.05f);
+    // ~15 ms one-pole: chord notes arrive over ~4 ms on DIN, so the gain settles
+    // during the attack instead of stepping, and never clicks.
+    const float chordGainCoef = 1.0f - std::exp(-1.0f / (0.015f * float(rate)));
+    auto clearHeld = [&]() { std::fill(std::begin(held), std::end(held), false); heldCount = 0; };
 
     struct sched_param sp{};
     sp.sched_priority = 80;
@@ -805,10 +938,17 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
         MidiMsg m;
         while (ring.pop(m)) {
             switch (m.type) {
-            case MidiMsg::NoteOn:  eng->noteOn(m.a, float(m.b) * (1.0f / 127.0f), 0, 0); break;
-            case MidiMsg::NoteOff: eng->noteOff(m.a, 0.0f, 0, 0); break;
+            case MidiMsg::NoteOn:
+                eng->noteOn(m.a, float(m.b) * (1.0f / 127.0f), 0, 0);
+                if (m.a >= 0 && m.a < 128 && !held[m.a]) { held[m.a] = true; ++heldCount; }
+                break;
+            case MidiMsg::NoteOff:
+                eng->noteOff(m.a, 0.0f, 0, 0);
+                if (m.a >= 0 && m.a < 128 && held[m.a]) { held[m.a] = false; --heldCount; }
+                break;
             case MidiMsg::CC:
-                if (int(m.a) == cfg.breath_cc) breathTarget = float(m.b) * (1.0f / 127.0f);
+                if (int(m.a) == cfg.chord_cc && cfg.chord_cc >= 0) chordOn = m.b >= 64;
+                else if (int(m.a) == cfg.breath_cc) breathTarget = float(m.b) * (1.0f / 127.0f);
                 else if (m.a == 1) {
                     // Vital feeds mod wheel through BOTH the per-channel engine
                     // call and the "mod_wheel" control (the mod-matrix source).
@@ -816,8 +956,8 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
                     eng->setModWheelAllChannels(v);
                     if (modWheelCtl) modWheelCtl->set(v);
                 } else if (m.a == 64) { if (m.b >= 64) eng->sustainOn(0); else eng->sustainOff(0, 0); }
-                else if (m.a == 120) eng->allSoundsOff();
-                else if (m.a == 123) eng->allNotesOff(0, 0);
+                else if (m.a == 120) { eng->allSoundsOff(); clearHeld(); }
+                else if (m.a == 123) { eng->allNotesOff(0, 0); clearHeld(); }
                 break;
             case MidiMsg::PitchBend: {
                 const float v = float(m.a) * (1.0f / 8192.0f);
@@ -831,8 +971,8 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
             case MidiMsg::PolyPressure:
                 eng->setAftertouch(float(m.a), float(m.b) * (1.0f / 127.0f), 0, 0);
                 break;
-            case MidiMsg::AllOff: eng->allNotesOff(0, 0); break;
-            case MidiMsg::SoundsOff: eng->allSoundsOff(); break;
+            case MidiMsg::AllOff: eng->allNotesOff(0, 0); clearHeld(); break;
+            case MidiMsg::SoundsOff: eng->allSoundsOff(); clearHeld(); break;
             case MidiMsg::Patch:
                 g_requestedPatch.store(m.a, std::memory_order_release);
                 break;
@@ -842,6 +982,44 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
         // Render the period in engine-sized chunks (kMaxBufferSize = 128).
         bool rendered = false;
         if (synth.getCriticalSection().tryEnter()) {
+            // Chord-mode control override, applied inside the critical section so
+            // it cannot interleave with a patch load. A patch load resets every
+            // control to the patch's values, so re-save and re-apply after one.
+            {
+                const int loaded = g_loadedPatch.load(std::memory_order_acquire);
+                if (chordApplied && (!chordOn || loaded != chordAppliedPatch)) {
+                    if (loaded == chordAppliedPatch) {   // disarmed: give the patch its values back
+                        if (polyphonyCtl) polyphonyCtl->set(savedPolyphony);
+                        if (portaTimeCtl) portaTimeCtl->set(savedPortaTime);
+                    }
+                    chordApplied = false;
+                    if (!chordOn) {
+                        g_chordOsWant.store(-1, std::memory_order_release);
+                        g_chordEvent.store(2, std::memory_order_release);
+                    }
+                }
+                if (chordOn && !chordApplied) {
+                    savedPolyphony = polyphonyCtl ? polyphonyCtl->value() : 1.0f;
+                    savedPortaTime = portaTimeCtl ? portaTimeCtl->value() : -10.0f;
+                    if (polyphonyCtl && savedPolyphony < float(cfg.chord_polyphony))
+                        polyphonyCtl->set(float(cfg.chord_polyphony));
+                    if (portaTimeCtl && !cfg.chord_glide) portaTimeCtl->set(-10.0f);
+                    chordApplied = true;
+                    chordAppliedPatch = loaded;
+                    g_chordSavedPoly.store(int(savedPolyphony), std::memory_order_relaxed);
+                    g_chordOsWant.store(cfg.chord_oversampling, std::memory_order_release);
+                    g_chordEvent.store(1, std::memory_order_release);   // logged by the loader thread, not here (RT)
+                }
+            }
+            // Measured per-patch chord level (calibrated on 4-note chords) when the
+            // patch has one, scaled by voice count around 4 so 5-note SOLO voicings
+            // still come down a little; otherwise the flat held^-exp estimate.
+            const float measuredChord = g_chordPatchGain.load(std::memory_order_acquire);
+            const float heldF = float(std::max(heldCount, 1));
+            const float chordGainTarget = !chordOn ? 1.0f
+                : chordTrim * (measuredChord >= 0.0f
+                                   ? measuredChord * std::pow(heldF * 0.25f, -cfg.chord_gain_exp)
+                                   : std::pow(heldF, -cfg.chord_gain_exp));
             synth.processModulationChanges();
             const float patchGain = g_patchGain.load(std::memory_order_acquire);
             int done = 0;
@@ -862,8 +1040,10 @@ int run(const HostConfig& cfg, HostSynth& synth, SpscRing<1024>& ring) {
                 eng->process(chunk);
                 const float* out = reinterpret_cast<const float*>(eng->output(0)->buffer);
                 for (int i = 0; i < chunk; ++i) {
-                    float l = out[size_t(stride) * size_t(i)] * masterGain * patchGain;
-                    float r = out[size_t(stride) * size_t(i) + 1] * masterGain * patchGain;
+                    chordGain += chordGainCoef * (chordGainTarget - chordGain);
+                    const float g = masterGain * patchGain * chordGain;
+                    float l = out[size_t(stride) * size_t(i)] * g;
+                    float r = out[size_t(stride) * size_t(i) + 1] * g;
                     // instant-attack peak limiter shared across channels
                     const float peak = std::max(std::fabs(l), std::fabs(r));
                     if (peak * limiterGain > limiterThresh) limiterGain = limiterThresh / peak;
@@ -1001,6 +1181,13 @@ constexpr float kGainLimitDb = 15.0f;               // .gains parser clamps here
 // corner of the keyboard dominate the patch's loudness (it cost 22-reese-growl
 // 5.9 dB, enough to drag the whole bank's target down with it).
 constexpr double kAudibleRangeDb = 40.0;
+// Chord grid for chord-mode levels: four-note seventh chords in the register
+// the NuEVI chord voicer actually uses (upper structures C3..C5, top voice
+// Bb3..B4), at the velocity chord mode sends for a 4-note voicing (~117/sqrt 4).
+constexpr int kChords[3][4] = {{50, 53, 57, 60}, {53, 57, 60, 64}, {55, 59, 62, 65}};
+constexpr float kChordBreaths[3] = {0.55f, 0.80f, 1.00f};
+constexpr float kChordVelocity = 58.0f / 127.0f;
+constexpr float kChordGainLimitDb = 24.0f;          // .gains.chord parser clamps here too
 }
 
 // Accumulates Welch-averaged band energies of the K-weighted signal, and the
@@ -1089,9 +1276,16 @@ struct PatchMeasurement {
     double absPeakDbfs = -200.0;     // worst peak incl. attack
     int silentConditions = 0;        // grid cells inaudible against the patch itself
     double worstBreathDipDb = 0.0;   // largest drop caused by MORE breath
+    bool chordMeasured = false;      // chord-mode grid (patch forced to chord_polyphony)
+    double chordLoudnessDb = -200.0;
+    double chordSustainPeakDbfs = -200.0;
+    double chordAbsPeakDbfs = -200.0;
+    double chordEnergyAdjustDb = 0.0; // single-note minus chord K-weighted energy, same patch
 };
 
-static int runNormalize(const HostConfig& cfg) {
+// chordsOnly: measure and write .gains.chord only, leaving .gains untouched
+// (chord levels are then computed against the patch gains already in effect).
+static int runNormalize(const HostConfig& cfg, bool chordsOnly) {
     using namespace loudness;
     const PatchList patches = scanPatches(cfg.patch_dir);
     if (patches.paths.empty()) {
@@ -1107,10 +1301,17 @@ static int runNormalize(const HostConfig& cfg) {
     eng->setBpm(120.0f);
     synth.pauseProcessing(false);
     vital::Value* macro1 = nullptr;
+    vital::Value* polyphonyCtl = nullptr;
+    vital::Value* portaTimeCtl = nullptr;
     {
         auto it = synth.getControls().find("macro_control_1");
         if (it != synth.getControls().end()) macro1 = it->second;
+        it = synth.getControls().find("polyphony");
+        if (it != synth.getControls().end()) polyphonyCtl = it->second;
+        it = synth.getControls().find("portamento_time");
+        if (it != synth.getControls().end()) portaTimeCtl = it->second;
     }
+    const bool measureChords = cfg.chord_cc >= 0;
 
     const int chunk = vital::kMaxBufferSize;
     const int stride = vital::poly_float::kSize;
@@ -1119,6 +1320,8 @@ static int runNormalize(const HostConfig& cfg) {
     Biquad hpL = makeKHighpass(), hpR = makeKHighpass();
     BandLoudness meterL, meterR;
     double peakAbs = 0.0, peakSustain = 0.0;
+    double sumSqK = 0.0;                     // K-weighted energy of measured windows
+    long countK = 0;
 
     // Renders `sec` of audio. `measure` feeds the band meters and the sustain
     // peak; `trackPeak` accumulates the true peak. They differ because the note
@@ -1142,8 +1345,12 @@ static int runNormalize(const HostConfig& cfg) {
                     if (measure) peakSustain = std::max(peakSustain, mag);
                 }
                 if (measure) {
-                    meterL.push(hpL.process(shelfL.process(rawL)));
-                    meterR.push(hpR.process(shelfR.process(rawR)));
+                    const double kl = hpL.process(shelfL.process(rawL));
+                    const double kr = hpR.process(shelfR.process(rawR));
+                    meterL.push(kl);
+                    meterR.push(kr);
+                    sumSqK += 0.5 * (kl * kl + kr * kr);
+                    ++countK;
                 }
             }
             t += chunk / double(sr);
@@ -1179,51 +1386,138 @@ static int runNormalize(const HostConfig& cfg) {
         eng->allSoundsOff();
         renderSec(0.25f, false, false);
 
-        std::vector<double> condDb, condWeight;
-        condDb.reserve(20); condWeight.reserve(20);
-        for (int ni = 0; ni < 5; ++ni) {
-            double prevBreathDb = -1e9;
-            for (int bi = 0; bi < 4; ++bi) {
-                const float level = kBreaths[bi];
-                if (macro1) macro1->set(level);
+        if (chordsOnly) {
+            // Chord levels are relative to the patch's own single notes (measured
+            // in the chord grid below), so the bank-wide single-note grid that
+            // feeds .gains is not needed -- it is most of the run time.
+            meas[i].loaded = true;
+            meas[i].loudnessDb = 0.0;
+        } else {
+            std::vector<double> condDb, condWeight;
+            condDb.reserve(20); condWeight.reserve(20);
+            for (int ni = 0; ni < 5; ++ni) {
+                double prevBreathDb = -1e9;
+                for (int bi = 0; bi < 4; ++bi) {
+                    const float level = kBreaths[bi];
+                    if (macro1) macro1->set(level);
+                    shelfL.reset(); shelfR.reset(); hpL.reset(); hpR.reset();
+                    meterL.reset(); meterR.reset();
+                    eng->noteOn(kNotes[ni], 0.79f, 0, 0);
+                    eng->setChannelAftertouch(0, level, 0);  // breath_to_at mirroring
+                    renderSec(kSettleSec, false, true);      // attack: peak only
+                    renderSec(kMeasureSec, true, true);      // sustain: peak + loudness
+                    eng->noteOff(kNotes[ni], 0.0f, 0, 0);
+                    eng->allSoundsOff();
+                    renderSec(0.25f, false, false);          // flush; kill transient ignored
+                    // Average the two channels' band loudness in the energy domain
+                    // (a dB average would penalize hard-panned or wide patches).
+                    const double lDb = meterL.loudnessDb(), rDb = meterR.loudnessDb();
+                    const double db = 10.0 * std::log10(
+                        0.5 * (std::pow(10.0, lDb / 10.0) + std::pow(10.0, rDb / 10.0)));
+                    if (prevBreathDb > -1e8)                 // quieter with MORE breath
+                        worstDip = std::max(worstDip, prevBreathDb - db);
+                    prevBreathDb = db;
+                    condDb.push_back(db);
+                    condWeight.push_back(double(kNoteWeights[ni]) * double(kBreathWeights[bi]));
+                }
+            }
+            // Aggregate only over cells that are audible relative to the patch
+            // itself. A dead corner of the keyboard is not part of how loud the
+            // patch sounds, but in a dB-domain mean it would dominate.
+            const double loudest = *std::max_element(condDb.begin(), condDb.end());
+            double weighted = 0.0, weightSum = 0.0;
+            int silent = 0;
+            for (size_t c = 0; c < condDb.size(); ++c) {
+                if (condDb[c] < loudest - kAudibleRangeDb) { ++silent; continue; }
+                weighted += condDb[c] * condWeight[c];
+                weightSum += condWeight[c];
+            }
+            meas[i].loaded = true;
+            meas[i].loudnessDb = weightSum > 0.0 ? weighted / weightSum : -200.0;
+            meas[i].absPeakDbfs = 20.0 * std::log10(peakAbs > 1e-6 ? peakAbs : 1e-6);
+            meas[i].sustainPeakDbfs = 20.0 * std::log10(peakSustain > 1e-6 ? peakSustain : 1e-6);
+            meas[i].silentConditions = silent;
+            meas[i].worstBreathDipDb = worstDip;
+        }
+
+        // ---- chord-mode grid: the patch as vitalsynth plays it while the EWI
+        // has chord mode armed (polyphony raised, glide per chord_glide).
+        if (!measureChords) continue;
+        if (polyphonyCtl && polyphonyCtl->value() < float(cfg.chord_polyphony))
+            polyphonyCtl->set(float(cfg.chord_polyphony));
+        if (portaTimeCtl && !cfg.chord_glide) portaTimeCtl->set(-10.0f);
+        if (cfg.chord_oversampling >= 0) {
+            auto it = synth.getControls().find("oversampling");
+            if (it != synth.getControls().end()) it->second->set(vital::mono_float(cfg.chord_oversampling));
+            eng->checkOversampling();
+        }
+        auto chordOn = [&](int c) { for (int n : kChords[c]) eng->noteOn(n, kChordVelocity, 0, 0); };
+        auto chordOff = [&](int c) { for (int n : kChords[c]) eng->noteOff(n, 0.0f, 0, 0); };
+        if (macro1) macro1->set(kChordBreaths[2]);       // discarded warm-up chord, as above
+        chordOn(1);
+        eng->setChannelAftertouch(0, kChordBreaths[2], 0);
+        renderSec(0.3f, false, false);
+        chordOff(1);
+        eng->allSoundsOff();
+        renderSec(0.25f, false, false);
+        peakAbs = 0.0;
+        peakSustain = 0.0;
+        // Chord level is matched to the SAME patch's single notes on K-weighted
+        // energy (BS.1770 / LUFS style), not on the band-loudness model .gains
+        // uses. Band loudness exists to compare different timbres; here the
+        // timbre is identical and only the voice count changes, and that model
+        // reads a chord's wider spectrum as far louder (it cut chords 6-15 dB,
+        // which played clearly quieter than the patch). The reference is a single
+        // note in the middle of the chords, at each of the same breath levels.
+        std::vector<double> chordDb;
+        double energyDiffSum = 0.0;
+        int energyDiffCount = 0;
+        auto energyDb = [&]() { return 10.0 * std::log10(countK ? std::max(sumSqK / double(countK), 1e-20) : 1e-20); };
+        for (float level : kChordBreaths) {
+            if (macro1) macro1->set(level);
+            shelfL.reset(); shelfR.reset(); hpL.reset(); hpR.reset();
+            meterL.reset(); meterR.reset();
+            sumSqK = 0.0; countK = 0;
+            eng->noteOn(kChords[1][2], 0.79f, 0, 0);       // single-note reference
+            eng->setChannelAftertouch(0, level, 0);
+            renderSec(kSettleSec, false, false);
+            renderSec(kMeasureSec, true, false);
+            eng->noteOff(kChords[1][2], 0.0f, 0, 0);
+            eng->allSoundsOff();
+            renderSec(0.25f, false, false);
+            const double singleE = energyDb();
+            double chordESum = 0.0;
+            for (int c = 0; c < 3; ++c) {
                 shelfL.reset(); shelfR.reset(); hpL.reset(); hpR.reset();
                 meterL.reset(); meterR.reset();
-                eng->noteOn(kNotes[ni], 0.79f, 0, 0);
-                eng->setChannelAftertouch(0, level, 0);  // breath_to_at mirroring
-                renderSec(kSettleSec, false, true);      // attack: peak only
-                renderSec(kMeasureSec, true, true);      // sustain: peak + loudness
-                eng->noteOff(kNotes[ni], 0.0f, 0, 0);
+                sumSqK = 0.0; countK = 0;
+                chordOn(c);
+                eng->setChannelAftertouch(0, level, 0);
+                renderSec(kSettleSec, false, true);
+                renderSec(kMeasureSec, true, true);
+                chordOff(c);
                 eng->allSoundsOff();
-                renderSec(0.25f, false, false);          // flush; kill transient ignored
-                // Average the two channels' band loudness in the energy domain
-                // (a dB average would penalize hard-panned or wide patches).
+                renderSec(0.25f, false, false);
+                chordESum += energyDb();
                 const double lDb = meterL.loudnessDb(), rDb = meterR.loudnessDb();
-                const double db = 10.0 * std::log10(
-                    0.5 * (std::pow(10.0, lDb / 10.0) + std::pow(10.0, rDb / 10.0)));
-                if (prevBreathDb > -1e8)                 // quieter with MORE breath
-                    worstDip = std::max(worstDip, prevBreathDb - db);
-                prevBreathDb = db;
-                condDb.push_back(db);
-                condWeight.push_back(double(kNoteWeights[ni]) * double(kBreathWeights[bi]));
+                chordDb.push_back(10.0 * std::log10(
+                    0.5 * (std::pow(10.0, lDb / 10.0) + std::pow(10.0, rDb / 10.0))));
+            }
+            if (singleE > -150.0) {
+                energyDiffSum += singleE - chordESum / 3.0;
+                ++energyDiffCount;
             }
         }
-        // Aggregate only over cells that are audible relative to the patch
-        // itself. A dead corner of the keyboard is not part of how loud the
-        // patch sounds, but in a dB-domain mean it would dominate.
-        const double loudest = *std::max_element(condDb.begin(), condDb.end());
-        double weighted = 0.0, weightSum = 0.0;
-        int silent = 0;
-        for (size_t c = 0; c < condDb.size(); ++c) {
-            if (condDb[c] < loudest - kAudibleRangeDb) { ++silent; continue; }
-            weighted += condDb[c] * condWeight[c];
-            weightSum += condWeight[c];
-        }
-        meas[i].loaded = true;
-        meas[i].loudnessDb = weightSum > 0.0 ? weighted / weightSum : -200.0;
-        meas[i].absPeakDbfs = 20.0 * std::log10(peakAbs > 1e-6 ? peakAbs : 1e-6);
-        meas[i].sustainPeakDbfs = 20.0 * std::log10(peakSustain > 1e-6 ? peakSustain : 1e-6);
-        meas[i].silentConditions = silent;
-        meas[i].worstBreathDipDb = worstDip;
+        meas[i].chordEnergyAdjustDb = energyDiffCount ? energyDiffSum / energyDiffCount : 0.0;
+        const double chordLoudest = *std::max_element(chordDb.begin(), chordDb.end());
+        double chordSum = 0.0;
+        int chordCells = 0;
+        for (double db : chordDb)
+            if (db >= chordLoudest - kAudibleRangeDb) { chordSum += db; ++chordCells; }
+        meas[i].chordMeasured = chordCells > 0;
+        meas[i].chordLoudnessDb = chordCells ? chordSum / chordCells : -200.0;
+        meas[i].chordAbsPeakDbfs = 20.0 * std::log10(peakAbs > 1e-6 ? peakAbs : 1e-6);
+        meas[i].chordSustainPeakDbfs = 20.0 * std::log10(peakSustain > 1e-6 ? peakSustain : 1e-6);
     }
 
     // ---- choose a target every patch can actually reach.
@@ -1263,7 +1557,27 @@ static int runNormalize(const HostConfig& cfg) {
                  feasible, median, loud.size());
 
     // ---- pass 2: emit gains.
-    std::string out;
+    std::string out, chordOut;
+    // Chord level: make a chord as loud as THIS patch's single notes (both are
+    // scaled by the same patch gain live), capped so the chord's own peaks stay
+    // inside the same sustained/transient ceilings the patch gain respects.
+    auto emitChord = [&](size_t i, double patchGainDb) {
+        const PatchMeasurement& m = meas[i];
+        if (!m.chordMeasured) return;
+        const double want = m.chordEnergyAdjustDb;
+        const double headroom = std::min(
+            kSustainCeilingDb - kSustainGridMarginDb - (m.chordSustainPeakDbfs + patchGainDb),
+            kTruePeakCeilingDb - (m.chordAbsPeakDbfs + patchGainDb));
+        const double capped = std::min(want, headroom);
+        const float adjust = clampv(float(capped), -kChordGainLimitDb, kChordGainLimitDb);
+        char line[320];
+        std::snprintf(line, sizeof line, "%s %.2f\n", patches.names[i].c_str(), adjust);
+        chordOut += line;
+        std::fprintf(stderr, "normalize: %-28s chord energy %+6.2f dB vs single (band model would say %+6.2f), peak %6.1f dBFS -> %+6.2f dB%s\n",
+                     patches.names[i].c_str(), -m.chordEnergyAdjustDb, m.chordLoudnessDb - m.loudnessDb,
+                     m.chordAbsPeakDbfs, adjust,
+                     want - double(adjust) > 0.25 ? " HEADROOM-CAPPED" : "");
+    };
     for (size_t i = 0; i < patches.paths.size(); ++i) {
         const PatchMeasurement& m = meas[i];
         if (!m.loaded) {
@@ -1273,6 +1587,10 @@ static int runNormalize(const HostConfig& cfg) {
             char line[320];
             std::snprintf(line, sizeof line, "%s 0.00\n", patches.names[i].c_str());
             out += line;
+            continue;
+        }
+        if (chordsOnly) {   // patch gain stays whatever .gains + trims already give it
+            emitChord(i, 20.0 * std::log10(std::max(patches.gains[i], 1e-6f)));
             continue;
         }
         const double headroom = headroomOf(m);
@@ -1306,7 +1624,20 @@ static int runNormalize(const HostConfig& cfg) {
                      "normalize: %-28s %7.2f dB loud, sustain %6.1f peak %6.1f dBFS -> %+6.2f dB%s\n",
                      patches.names[i].c_str(), m.loudnessDb, m.sustainPeakDbfs,
                      m.absPeakDbfs, adjust, flags.c_str());
+        emitChord(i, double(adjust));
     }
+    if (measureChords) {
+        const std::string chordPath = cfg.patch_dir + "/.gains.chord";
+        if (FILE* g = std::fopen(chordPath.c_str(), "w")) {
+            std::fwrite(chordOut.data(), 1, chordOut.size(), g);
+            std::fclose(g);
+            std::fprintf(stderr, "normalize: wrote %s\n", chordPath.c_str());
+        } else {
+            std::fprintf(stderr, "normalize: cannot write %s\n", chordPath.c_str());
+            return 1;
+        }
+    }
+    if (chordsOnly) return 0;
     const std::string gainsPath = cfg.patch_dir + "/.gains";
     if (FILE* g = std::fopen(gainsPath.c_str(), "w")) {
         std::fwrite(out.data(), 1, out.size(), g);
@@ -1316,6 +1647,71 @@ static int runNormalize(const HostConfig& cfg) {
     }
     std::fprintf(stderr, "normalize: cannot write %s\n", gainsPath.c_str());
     return 1;
+}
+
+// --bench: how much of one core each patch needs, mono and as a chord, at the
+// patch's oversampling and at 1x. Live audio needs comfortable margin under
+// 100% (the period is 1.3 ms), so treat ~70% as the practical ceiling.
+static int runBench(const HostConfig& cfg) {
+    const PatchList patches = scanPatches(cfg.patch_dir);
+    static HostSynth synth;
+    vital::SoundEngine* eng = synth.getEngine();
+    const int sr = 48000;
+    synth.pauseProcessing(true);
+    eng->setSampleRate(sr);
+    eng->updateAllModulationSwitches();
+    eng->setBpm(120.0f);
+    synth.pauseProcessing(false);
+    auto ctl = [&](const char* n) -> vital::Value* {
+        auto it = synth.getControls().find(n);
+        return it != synth.getControls().end() ? it->second : nullptr;
+    };
+    const int chunk = vital::kMaxBufferSize;
+    double t = 0.0;
+    auto render = [&](double sec) {
+        for (int done = 0; done < int(sec * sr); done += chunk) {
+            synth.processModulationChanges();
+            eng->correctToTime(t);
+            eng->process(chunk);
+            t += chunk / double(sr);
+        }
+    };
+    static const int chord[4] = {53, 57, 60, 64};
+    int lastVoices = 0;
+    auto timed = [&](int notes, int os) {
+        if (vital::Value* o = ctl("oversampling")) o->set(vital::mono_float(os));
+        eng->checkOversampling();
+        if (vital::Value* m = ctl("macro_control_1")) m->set(0.8f);
+        eng->setChannelAftertouch(0, 0.8f, 0);
+        render(0.05);   // let control changes (polyphony) reach the voice handler first
+        for (int i = 0; i < notes; ++i) eng->noteOn(chord[i], 0.6f, 0, 0);
+        render(0.3);
+        lastVoices = eng->getNumActiveVoices();
+        const auto t0 = std::chrono::steady_clock::now();
+        render(2.0);
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        for (int i = 0; i < notes; ++i) eng->noteOff(chord[i], 0.0f, 0, 0);
+        eng->allSoundsOff();
+        render(0.1);
+        return 100.0 * sec / 2.0;
+    };
+    std::printf("%-30s %5s %8s %10s %10s\n", "patch", "os", "mono%", "chord@os%", "chord@1x%");
+    for (size_t i = 0; i < patches.paths.size(); ++i) {
+        std::string error;
+        if (!synth.loadFromFile(juce::File(juce::String(patches.paths[i])), error)) continue;
+        vital::Value* osCtl = ctl("oversampling");
+        const int os = osCtl ? int(osCtl->value()) : 1;
+        const double mono = timed(1, os);
+        if (vital::Value* pc = ctl("polyphony"))
+            if (pc->value() < float(cfg.chord_polyphony)) pc->set(float(cfg.chord_polyphony));
+        const double c2 = timed(4, os);
+        const int v2 = lastVoices;
+        const double c1 = timed(4, 0);
+        std::printf("%-30s %4dx %7.0f%% %9.0f%% %9.0f%%  (%d voices)%s\n", patches.names[i].c_str(), 1 << os,
+                    mono, c2, c1, v2, c1 > 70.0 ? "  <- too heavy even at 1x" : (c2 > 70.0 ? "  <- needs 1x" : ""));
+        std::fflush(stdout);
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------- main
@@ -1341,20 +1737,25 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "config: cannot read %s (defaults)\n", argv[i + 1]);
         }
     bool normalizeMode = false;
+    bool chordsOnlyMode = false;
+    bool benchMode = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--device") && i + 1 < argc) cfg.audio_device = argv[++i];
         else if (!std::strcmp(argv[i], "--patch-dir") && i + 1 < argc) cfg.patch_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--normalize")) normalizeMode = true;
+        else if (!std::strcmp(argv[i], "--normalize-chords")) normalizeMode = chordsOnlyMode = true;
+        else if (!std::strcmp(argv[i], "--bench")) benchMode = true;
         else if (!std::strcmp(argv[i], "--config")) ++i;
         else if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
-            std::printf("vitalsynth [--config FILE] [--device DEV] [--patch-dir DIR] [--normalize]\n");
+            std::printf("vitalsynth [--config FILE] [--device DEV] [--patch-dir DIR] [--normalize] [--normalize-chords] [--bench]\n");
             return 0;
         }
     }
     cfg.sanitize();
     enableFlushToZero();
 
-    if (normalizeMode) return runNormalize(cfg);
+    if (normalizeMode) return runNormalize(cfg, chordsOnlyMode);
+    if (benchMode) return runBench(cfg);
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);

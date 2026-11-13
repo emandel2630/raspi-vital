@@ -275,6 +275,15 @@ namespace vital {
   void VoiceHandler::process(int num_samples) {
     global_router_.process(num_samples);
 
+    // Apply polyphony even while silent (raspi-vital change). Upstream read it
+    // only after the no-active-voices early return, so a polyphony change made
+    // between notes (vitalsynth arming EWI chord mode) was not seen until a voice
+    // was already sounding: the first chord's note-ons were allocated at the old
+    // polyphony and a mono patch played it as one gliding note. All
+    // kMaxPolyphony voices are preallocated, so this never allocates.
+    int polyphony = static_cast<int>(std::roundf(input(kPolyphony)->at(0)[0]));
+    setPolyphony(utils::iclamp(polyphony, 1, kMaxActivePolyphony));
+
     int num_voices = active_voices_.size();
     if (num_voices == 0) {
       if (last_num_voices_)
@@ -283,9 +292,6 @@ namespace vital {
       last_num_voices_ = num_voices;
       return;
     }
-
-    int polyphony = static_cast<int>(std::roundf(input(kPolyphony)->at(0)[0]));
-    setPolyphony(utils::iclamp(polyphony, 1, kMaxActivePolyphony));
 
     int priority = utils::roundToInt(input(kVoicePriority)->at(0))[0];
     voice_priority_ = static_cast<VoicePriority>(priority);
